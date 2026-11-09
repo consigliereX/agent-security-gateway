@@ -1,5 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,12 +107,15 @@ class ShellAdapter(_BaseAdapter):
         if executable not in self.allowed_executables:
             raise ValueError("executable not allowed")
 
-        action = PlannedAction(action_type="exec_shell", target=" ".join(command[:2]))
+        # Inspect and fingerprint the exact argv that will execute. JSON is
+        # unambiguous for arguments containing whitespace or quotes.
+        argv = [str(part) for part in command]
+        action = PlannedAction(action_type="exec_shell", target=json.dumps(argv, ensure_ascii=False, separators=(",", ":")))
         pre = self._inspect(context=context, planned_actions=[action], memory_reads=[], memory_writes=[])
         self._enforce_pre(pre)
 
         proc = subprocess.run(
-            list(command),
+            argv,
             capture_output=True,
             text=True,
             timeout=self.timeout_seconds,
@@ -143,7 +148,9 @@ class ShellAdapter(_BaseAdapter):
                 "decision_pre": pre.get("decision"),
                 "decision_post": post.get("decision"),
                 "returncode": proc.returncode,
-                "command": list(command),
+                "executable": executable,
+                "argv_count": len(argv),
+                "command_sha256": hashlib.sha256(action.target.encode("utf-8")).hexdigest(),
                 "session_id": context.session_id,
                 "turn_id": context.turn_id,
                 "agent_id": context.agent_id,

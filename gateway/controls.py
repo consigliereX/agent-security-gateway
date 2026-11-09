@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ class GatewayRuntimeConfig:
     auth_enabled: bool = False
     auth_header: str = "x-api-key"
     api_keys: Tuple[str, ...] = ()
+    operator_api_keys: Tuple[str, ...] = ()
     rate_limit_enabled: bool = False
     rate_limit_requests: int = 120
     rate_limit_window_seconds: int = 60
@@ -27,6 +29,8 @@ class GatewayRuntimeConfig:
             raise ValueError("rate_limit_window_seconds must be >= 1")
         if self.auth_enabled and not self.api_keys:
             raise ValueError("auth is enabled but no API keys are configured")
+        if set(self.api_keys) & set(self.operator_api_keys):
+            raise ValueError("agent and operator API keys must not overlap")
 
 
 class MetricsRegistry:
@@ -127,12 +131,23 @@ class GatewayGuardMiddleware(BaseHTTPMiddleware):
             return response
 
         provided_key = request.headers.get(self.config.auth_header, "")
-        if self.config.auth_enabled:
+        operator_only = path == "/approval/resolve" or path == "/operator" or path.startswith("/operator/")
+        if operator_only:
+            # Fail closed even in unauthenticated local development mode.
+            if not self.config.operator_api_keys:
+                response = self._auth_error("operator credentials are not configured", status_code=503)
+                self.metrics.inc_http(request.method, path, response.status_code)
+                return response
+            if not any(secrets.compare_digest(provided_key.encode("utf-8"), key.encode("utf-8")) for key in self.config.operator_api_keys):
+                response = self._auth_error("operator API key required", status_code=401 if not provided_key else 403)
+                self.metrics.inc_http(request.method, path, response.status_code)
+                return response
+        elif self.config.auth_enabled:
             if not self.config.api_keys:
                 response = self._auth_error("gateway auth misconfigured", status_code=503)
                 self.metrics.inc_http(request.method, path, response.status_code)
                 return response
-            if provided_key not in self.config.api_keys:
+            if not any(secrets.compare_digest(provided_key.encode("utf-8"), key.encode("utf-8")) for key in self.config.api_keys):
                 response = self._auth_error("missing or invalid API key", status_code=401)
                 self.metrics.inc_http(request.method, path, response.status_code)
                 return response

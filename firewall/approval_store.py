@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import secrets
 import sqlite3
@@ -280,27 +280,38 @@ class SQLiteApprovalStore:
     ) -> Optional[ApprovalRecord]:
         if not permit_token.strip():
             return None
+        # A conditional UPDATE provides one-time consumption even when two
+        # processes concurrently attempt to use the same permit.
         with self._lock:
-            cur = self._conn.execute("SELECT * FROM approvals WHERE permit_token = ?", (permit_token,))
-            row = cur.fetchone()
-        if row is None:
-            return None
-        record = self._row_to_record(row)
-        record = self._expire_if_needed(record)
-        if record.status != "approved":
-            return None
-        if record.session_id != session_id or record.agent_id != agent_id or record.action_fingerprint != action_fingerprint:
-            return None
-
-        expires_at = datetime.fromisoformat(record.permit_expires_at) if record.permit_expires_at else self._now()
-        if self._now() > expires_at:
-            expired = ApprovalRecord(**{**record.__dict__, "status": "expired"})
-            self._save(expired)
-            return None
-
-        used = ApprovalRecord(**{**record.__dict__, "status": "used"})
-        self._save(used)
-        return used
+            row = self._conn.execute(
+                "SELECT * FROM approvals WHERE permit_token = ?", (permit_token,)
+            ).fetchone()
+            if row is None:
+                return None
+            record = self._row_to_record(row)
+            if (
+                record.status != "approved"
+                or record.session_id != session_id
+                or record.agent_id != agent_id
+                or record.action_fingerprint != action_fingerprint
+            ):
+                return None
+            expiry = datetime.fromisoformat(record.permit_expires_at) if record.permit_expires_at else self._now()
+            if self._now() > expiry:
+                self._conn.execute(
+                    "UPDATE approvals SET status = 'expired' WHERE approval_id = ? AND status = 'approved'",
+                    (record.approval_id,),
+                )
+                self._conn.commit()
+                return None
+            cursor = self._conn.execute(
+                "UPDATE approvals SET status = 'used' WHERE approval_id = ? AND status = 'approved'",
+                (record.approval_id,),
+            )
+            self._conn.commit()
+            if cursor.rowcount != 1:
+                return None
+            return ApprovalRecord(**{**record.__dict__, "status": "used"})
 
     def _expire_if_needed(self, record: ApprovalRecord) -> ApprovalRecord:
         if record.status != "pending":

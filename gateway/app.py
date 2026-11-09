@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from typing import Any, Callable, Dict, Optional
@@ -44,6 +44,8 @@ def _parse_runtime_config() -> GatewayRuntimeConfig:
     auth_header = os.getenv("GATEWAY_AUTH_HEADER", "x-api-key").strip().lower()
     keys_raw = os.getenv("GATEWAY_API_KEYS", "")
     api_keys = tuple(sorted({k.strip() for k in keys_raw.split(",") if k.strip()}))
+    operator_keys_raw = os.getenv("GATEWAY_OPERATOR_API_KEYS", "")
+    operator_api_keys = tuple(sorted({k.strip() for k in operator_keys_raw.split(",") if k.strip()}))
 
     rl_enabled = _parse_bool_env("GATEWAY_RATE_LIMIT_ENABLED", False)
     rl_requests = int(os.getenv("GATEWAY_RATE_LIMIT_REQUESTS", "120"))
@@ -53,6 +55,7 @@ def _parse_runtime_config() -> GatewayRuntimeConfig:
         auth_enabled=auth_enabled,
         auth_header=auth_header,
         api_keys=api_keys,
+        operator_api_keys=operator_api_keys,
         rate_limit_enabled=rl_enabled,
         rate_limit_requests=rl_requests,
         rate_limit_window_seconds=rl_window,

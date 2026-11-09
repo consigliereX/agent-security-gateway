@@ -1,5 +1,6 @@
-﻿import tempfile
+import tempfile
 import unittest
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from unittest.mock import patch
@@ -50,20 +51,20 @@ class RedactingStubService(StubService):
 class AdaptersTests(unittest.TestCase):
     def test_shell_blocked_does_not_execute(self) -> None:
         svc = StubService(["block"])
-        adapter = ShellAdapter(service=svc, allowed_executables=["cmd"])
+        adapter = ShellAdapter(service=svc, allowed_executables=[sys.executable])
         ctx = AdapterContext(session_id="s1", user_input="run shell")
 
         with self.assertRaises(ToolExecutionDenied):
-            adapter.run(["cmd", "/c", "echo", "hello"], ctx)
+            adapter.run([sys.executable, "-c", "print('hello')"], ctx)
 
         self.assertEqual(len(svc.calls), 1)
 
     def test_shell_allowed_executes_and_posts(self) -> None:
         svc = StubService(["allow", "allow"])
-        adapter = ShellAdapter(service=svc, allowed_executables=["cmd"])
+        adapter = ShellAdapter(service=svc, allowed_executables=[sys.executable])
         ctx = AdapterContext(session_id="s1", user_input="run shell")
 
-        proc = adapter.run(["cmd", "/c", "echo", "hello"], ctx)
+        proc = adapter.run([sys.executable, "-c", "print('hello')"], ctx)
         self.assertEqual(proc.returncode, 0)
         self.assertIn("hello", proc.stdout.lower())
         self.assertEqual(len(svc.calls), 2)

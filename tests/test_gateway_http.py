@@ -1,4 +1,4 @@
-﻿import tempfile
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,7 +12,7 @@ class GatewayHttpTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = str(Path(self.tmpdir.name) / "session_state.sqlite3")
-        self.app = create_app(session_db_path=self.db_path)
+        self.app = create_app(session_db_path=self.db_path, runtime_config=GatewayRuntimeConfig(operator_api_keys=("operator-test-key",)))
         self.client = TestClient(self.app)
 
     def tearDown(self) -> None:
@@ -59,6 +59,7 @@ class GatewayHttpTests(unittest.TestCase):
 
         resolve = self.client.post(
             "/approval/resolve",
+            headers={"x-api-key": "operator-test-key"},
             json={
                 "approval_id": approval_id,
                 "approve": True,
@@ -100,7 +101,7 @@ class GatewayHttpTests(unittest.TestCase):
                 "user_input": "run this",
             },
         )
-        overview = self.client.get("/operator/api/overview?limit=10")
+        overview = self.client.get("/operator/api/overview?limit=10", headers={"x-api-key": "operator-test-key"})
         self.assertEqual(overview.status_code, 200)
         body = overview.json()
         self.assertIn("sessions", body)
@@ -150,7 +151,7 @@ class GatewayGuardsTests(unittest.TestCase):
             app.state.session_store.close()
 
     def test_auth_covers_operator_approval_and_metrics_endpoints(self) -> None:
-        cfg = GatewayRuntimeConfig(auth_enabled=True, api_keys=("k1",))
+        cfg = GatewayRuntimeConfig(auth_enabled=True, api_keys=("k1",), operator_api_keys=("ops-key",))
         app = create_app(session_db_path=self.db_path, runtime_config=cfg)
         client = TestClient(app)
         try:
@@ -169,8 +170,9 @@ class GatewayGuardsTests(unittest.TestCase):
 
             self.assertEqual(
                 client.get("/operator/api/overview", headers={"x-api-key": "k1"}).status_code,
-                200,
+                403,
             )
+            self.assertEqual(client.get("/operator/api/overview", headers={"x-api-key": "ops-key"}).status_code, 200)
             self.assertEqual(client.get("/metrics", headers={"x-api-key": "k1"}).status_code, 200)
             self.assertEqual(
                 client.post(

@@ -228,8 +228,9 @@ class SecretLeakDetector:
         )
 
     def detect(self, ctx: SecurityContext) -> List[Finding]:
-        text = _normalize_text(ctx.user_input, ctx.model_output)
-        raw_text = _normalize_text_preserve_case(ctx.user_input, ctx.model_output)
+        action_targets = [action.target for action in ctx.planned_actions]
+        text = _normalize_text(ctx.user_input, ctx.model_output, *action_targets)
+        raw_text = _normalize_text_preserve_case(ctx.user_input, ctx.model_output, *action_targets)
         findings: List[Finding] = []
 
         for rule in self.rules:
@@ -293,7 +294,7 @@ class ToolAbuseDetector:
 
     def detect(self, ctx: SecurityContext) -> List[Finding]:
         findings: List[Finding] = []
-        text = _normalize_text(ctx.user_input, ctx.model_output)
+        text = _normalize_text(ctx.user_input, ctx.model_output, *(action.target for action in ctx.planned_actions))
 
         for action in ctx.planned_actions:
             if action.action_type in self.sensitive_actions:

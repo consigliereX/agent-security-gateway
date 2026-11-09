@@ -251,10 +251,14 @@ python -m unittest discover -s tests -p "test_*.py"
 ```
 
 ### Production-like local run
+Configure two **distinct** high-entropy credentials (agent and operator).
+Agent credentials may inspect/submit, but **cannot** approve or read the operator console.
+Never put example keys on a publicly reachable service.
 ```powershell
 $env:FIREWALL_CONFIG="configs/production_profile.json"
 $env:GATEWAY_AUTH_ENABLED="true"
-$env:GATEWAY_API_KEYS="dev-secret-key"
+$env:GATEWAY_API_KEYS="replace-with-random-agent-key"
+$env:GATEWAY_OPERATOR_API_KEYS="replace-with-different-random-operator-key"
 $env:GATEWAY_RATE_LIMIT_ENABLED="true"
 $env:GATEWAY_RATE_LIMIT_REQUESTS="120"
 $env:GATEWAY_RATE_LIMIT_WINDOW_SECONDS="60"
@@ -266,7 +270,8 @@ uvicorn gateway.app:app --host 127.0.0.1 --port 8000
 docker build -t agent-security-gateway:local .
 docker run --rm -p 8000:8000 ^
   -e GATEWAY_AUTH_ENABLED=true ^
-  -e GATEWAY_API_KEYS=dev-secret-key ^
+  -e GATEWAY_API_KEYS=replace-with-random-agent-key ^
+  -e GATEWAY_OPERATOR_API_KEYS=replace-with-different-random-operator-key ^
   -e GATEWAY_RATE_LIMIT_ENABLED=true ^
   -e GATEWAY_RATE_LIMIT_REQUESTS=60 ^
   -e GATEWAY_RATE_LIMIT_WINDOW_SECONDS=60 ^
@@ -293,7 +298,8 @@ docker run --rm -p 8000:8000 ^
 - `FIREWALL_REDACTION_MASK_PII`
 - `GATEWAY_AUTH_ENABLED`
 - `GATEWAY_AUTH_HEADER`
-- `GATEWAY_API_KEYS`
+- `GATEWAY_API_KEYS` — agent/API credentials
+- `GATEWAY_OPERATOR_API_KEYS` — separate operator credentials; mandatory for `/approval/resolve` and `/operator`
 - `GATEWAY_RATE_LIMIT_ENABLED`
 - `GATEWAY_RATE_LIMIT_REQUESTS`
 - `GATEWAY_RATE_LIMIT_WINDOW_SECONDS`
@@ -338,8 +344,12 @@ api_key=[REDACTED:secret:...] user=[REDACTED:pii_email:...]
 - `POST /inspect/tool-call`
 
 ### Approval
-- `POST /approval/submit`
-- `POST /approval/resolve`
+- `POST /approval/submit` — agent credential (when authentication enabled)
+- `POST /approval/resolve` — **operator credential required** even if general auth is disabled
+
+The operator console (`/operator` and `/operator/api/*`) also requires an operator credential.
+Example header: `x-api-key: <operator-secret>`. If no operator key is configured,
+operator endpoints return HTTP 503 rather than granting access.
 
 ### Operator visibility
 - `GET /operator`
@@ -408,6 +418,16 @@ Ran 86 tests ... OK
 - deeper adversarial corpus expansion
 
 ---
+
+
+## Enforcement M1 and data retention
+
+- The shell adapter binds inspection and one-time permits to the **entire argument vector** using an unambiguous JSON representation; it executes those same arguments.
+- Secret-leakage and tool-abuse detectors also receive planned action targets. These heuristic detectors are **not** a sandbox or an exhaustive command interpreter.
+- Approved permits are atomically consumed once. Separate agent/operator API keys are required for distinct roles.
+- The shipped `gateway_sessions.sqlite3` has been removed from version control by this maintenance change, but **old Git history still contains it**. Assess any previous real session records/tokens and rotate exposed credentials as necessary; do not publish the local runtime DB.
+- This gateway cannot constrain an agent that retains access to tools outside its adapters. Use operating-system sandboxing, filesystem permissions, and egress controls.
+- Default general authentication is still off for local development: **bind only to `127.0.0.1`** unless explicitly secured behind a trustworthy network boundary.
 
 ## Operational limits
 

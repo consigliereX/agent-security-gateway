@@ -1,5 +1,6 @@
-﻿import tempfile
+import tempfile
 import unittest
+import sys
 from pathlib import Path
 
 from firewall.adapters import AdapterContext, ShellAdapter, ToolExecutionDenied
@@ -22,7 +23,7 @@ class ApprovalFlowAdapterTests(unittest.TestCase):
             session_store=session_store,
             approval_store=approval_store,
         )
-        self.adapter = ShellAdapter(service=self.service, allowed_executables=["cmd"])
+        self.adapter = ShellAdapter(service=self.service, allowed_executables=[sys.executable])
 
     def tearDown(self) -> None:
         self.service.approval_store.close()
@@ -33,7 +34,7 @@ class ApprovalFlowAdapterTests(unittest.TestCase):
         ctx = AdapterContext(session_id="s1", agent_id="a1", user_input="run shell")
 
         with self.assertRaises(ToolExecutionDenied) as denied:
-            self.adapter.run(["cmd", "/c", "echo", "hello"], ctx)
+            self.adapter.run([sys.executable, "-c", "print('hello')"], ctx)
 
         decision = denied.exception.decision
         self.assertEqual(decision["decision"], "require_approval")
@@ -50,13 +51,13 @@ class ApprovalFlowAdapterTests(unittest.TestCase):
         self.assertTrue(token)
 
         approved_ctx = AdapterContext(session_id="s1", agent_id="a1", user_input="run shell", approval_token=token)
-        proc = self.adapter.run(["cmd", "/c", "echo", "hello"], approved_ctx)
+        proc = self.adapter.run([sys.executable, "-c", "print('hello')"], approved_ctx)
         self.assertEqual(proc.returncode, 0)
 
     def test_denied_execution_stays_denied(self) -> None:
         ctx = AdapterContext(session_id="s2", agent_id="a1", user_input="run shell")
         with self.assertRaises(ToolExecutionDenied) as denied:
-            self.adapter.run(["cmd", "/c", "echo", "hello"], ctx)
+            self.adapter.run([sys.executable, "-c", "print('hello')"], ctx)
 
         approval_id = denied.exception.decision["approval"]["approval_id"]
         resolved = self.service.resolve_approval(
@@ -68,12 +69,12 @@ class ApprovalFlowAdapterTests(unittest.TestCase):
         self.assertEqual(resolved["status"], "denied")
 
         with self.assertRaises(ToolExecutionDenied):
-            self.adapter.run(["cmd", "/c", "echo", "hello"], ctx)
+            self.adapter.run([sys.executable, "-c", "print('hello')"], ctx)
 
     def test_expired_and_reused_permit_fail_closed(self) -> None:
         ctx = AdapterContext(session_id="s3", agent_id="a1", user_input="run shell")
         with self.assertRaises(ToolExecutionDenied) as denied:
-            self.adapter.run(["cmd", "/c", "echo", "hello"], ctx)
+            self.adapter.run([sys.executable, "-c", "print('hello')"], ctx)
 
         approval_id = denied.exception.decision["approval"]["approval_id"]
         resolved = self.service.resolve_approval(
@@ -91,11 +92,11 @@ class ApprovalFlowAdapterTests(unittest.TestCase):
             approval_token=resolved["permit_token"],
         )
         with self.assertRaises(ToolExecutionDenied):
-            self.adapter.run(["cmd", "/c", "echo", "hello"], expired_ctx)
+            self.adapter.run([sys.executable, "-c", "print('hello')"], expired_ctx)
 
         # Fresh approval to test replay rejection
         with self.assertRaises(ToolExecutionDenied) as denied2:
-            self.adapter.run(["cmd", "/c", "echo", "hello"], ctx)
+            self.adapter.run([sys.executable, "-c", "print('hello')"], ctx)
         approval_id2 = denied2.exception.decision["approval"]["approval_id"]
         resolved2 = self.service.resolve_approval(
             approval_id=approval_id2,
@@ -107,11 +108,11 @@ class ApprovalFlowAdapterTests(unittest.TestCase):
         token = resolved2["permit_token"]
 
         ok_ctx = AdapterContext(session_id="s3", agent_id="a1", user_input="run shell", approval_token=token)
-        proc = self.adapter.run(["cmd", "/c", "echo", "hello"], ok_ctx)
+        proc = self.adapter.run([sys.executable, "-c", "print('hello')"], ok_ctx)
         self.assertEqual(proc.returncode, 0)
 
         with self.assertRaises(ToolExecutionDenied):
-            self.adapter.run(["cmd", "/c", "echo", "hello"], ok_ctx)
+            self.adapter.run([sys.executable, "-c", "print('hello')"], ok_ctx)
 
     def test_permit_bound_to_normalized_action_context(self) -> None:
         first = self.service.inspect(

@@ -1,17 +1,18 @@
-﻿import tempfile
+import tempfile
 import unittest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from gateway.app import create_app
+from gateway.controls import GatewayRuntimeConfig
 
 
 class OperatorConsoleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = str(Path(self.tmpdir.name) / "gateway.sqlite3")
-        self.app = create_app(session_db_path=self.db_path)
+        self.app = create_app(session_db_path=self.db_path, runtime_config=GatewayRuntimeConfig(operator_api_keys=("operator-test-key",)))
         self.client = TestClient(self.app)
 
     def tearDown(self) -> None:
@@ -58,7 +59,7 @@ class OperatorConsoleTests(unittest.TestCase):
 
     def test_operator_overview_has_sessions_and_flagged_events(self) -> None:
         self._seed_events()
-        resp = self.client.get("/operator/api/overview?limit=20")
+        resp = self.client.get("/operator/api/overview?limit=20", headers={"x-api-key": "operator-test-key"})
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
 
@@ -73,7 +74,7 @@ class OperatorConsoleTests(unittest.TestCase):
 
     def test_operator_session_timeline_endpoint(self) -> None:
         self._seed_events()
-        resp = self.client.get("/operator/api/session/sess-console-1/timeline")
+        resp = self.client.get("/operator/api/session/sess-console-1/timeline", headers={"x-api-key": "operator-test-key"})
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["session_id"], "sess-console-1")
@@ -82,7 +83,7 @@ class OperatorConsoleTests(unittest.TestCase):
 
     def test_operator_console_html_renders(self) -> None:
         self._seed_events()
-        resp = self.client.get("/operator?session_id=sess-console-1")
+        resp = self.client.get("/operator?session_id=sess-console-1", headers={"x-api-key": "operator-test-key"})
         self.assertEqual(resp.status_code, 200)
         text = resp.text
         self.assertIn("Agent Security Gateway Operator Console", text)
