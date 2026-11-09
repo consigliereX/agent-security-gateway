@@ -437,6 +437,31 @@ Ran <N> tests ... OK
 - This is an adapter path-confinement measure, **not a process/container sandbox**: mount points, privileged processes, unmediated agent tools, and other I/O channels are outside this guarantee.
 - M2 regression tests simulate symlink swaps during approval, hard links, nested path traversal, HTTP 3xx responses, and proxy/redirect handler configuration without sending requests to external services.
 
+## Enforcement M3 — agent runtime integration and adversarial evidence
+
+M3 provides an **opt-in stdio MCP tool server** (`python -m gateway.mcp_stdio`) that routes agent file operations through the real gateway's policy-aware adapters. MCP framing is JSON-RPC over newline-delimited stdin/stdout. It is a restricted interface, **not an operating-system sandbox**.
+
+- The only tools exposed by default are `asg_read_file` and `asg_write_file`. The server exposes **no shell execution** or approval-resolution tool. HTTP GET is hidden unless `ASG_MCP_ALLOWED_HOSTS` is explicitly supplied; even then the central policy can block network actions.
+- Set `ASG_MCP_ROOT` to an **existing, absolute, isolated workspace** with no sensitive data. File operations remain confined to that root through the POSIX M2 adapter. Store session, approval, and audit SQLite state separately (`ASG_MCP_DB_PATH`), never inside the exposed workspace. The default state path is `~/.local/state/agent-security-gateway/mcp.sqlite3`.
+- MCP messages have a 128 KiB limit, file writes a 16 KiB UTF-8 limit, and each server process permits up to 128 tool-call attempts. The runtime assigns a nonempty random session identifier; agents cannot supply a session ID or approval token through its tool schemas.
+- To use this server with an MCP-capable agent client, register its command using the project's Python interpreter and the module `gateway.mcp_stdio`; supply `ASG_MCP_ROOT` and optionally `ASG_MCP_DB_PATH` as launch environment variables. This milestone **does not modify any agent's global configuration**.
+- **Disable direct/unmediated filesystem, shell, browser, network, and other tool access in the agent host.** Merely adding this MCP server to OMP, Claude Code, or another runtime does not force those clients to use it. Run the agent under separate OS/container confinement if bypass resistance is required.
+
+Run the offline integration and adversarial scenario (writes only to temporary directories):
+
+```bash
+python scripts/m3_adversarial.py --evidence .git/security-m3-evidence.json
+```
+
+A local OpenAI-compatible model can *optionally* be probed without executing any model-generated command outside the restricted MCP tool interface:
+
+```bash
+python scripts/m3_adversarial.py --evidence .git/security-m3-evidence.json \
+  --llm-url http://127.0.0.1:18080/v1/chat/completions --model coder
+```
+
+The scripted test deliberately reproduces one **unmediated subprocess bypass** on a disposable temporary file and records it as `FIND`, not `PASS`. That is an expected design limitation of adapter-level mediation; it is **not** proof of secure agent isolation. Successful M3 tests demonstrate real MCP transport and mediated adapter behavior, **not** enforcement against processes with unrestricted OS privileges. The M3 script does not automatically connect to OMP or claim an actual OMP run.
+
 ## Operational limits
 
 - API-key auth is shared-secret based
