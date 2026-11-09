@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -162,17 +164,94 @@ class ShellAdapter(_BaseAdapter):
 
 
 class FileSystemAdapter(_BaseAdapter):
+    """POSIX file adapter with dirfd + O_NOFOLLOW path traversal.
+
+    The configured directory must be trusted. This confines paths/symlinks,
+    not hard-mounted filesystems or the process's other system privileges.
+    """
+
     def __init__(self, service: GatewayInspectionService, base_dir: str, max_bytes: int = 65536) -> None:
         super().__init__(service=service, adapter_name="filesystem")
+        if not (
+            os.name == "posix"
+            and hasattr(os, "O_NOFOLLOW")
+            and hasattr(os, "O_DIRECTORY")
+            and os.open in os.supports_dir_fd
+            and os.mkdir in os.supports_dir_fd
+        ):
+            raise RuntimeError("secure filesystem adapter requires POSIX dirfd and O_NOFOLLOW")
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
         self.base_dir = Path(base_dir).resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_bytes
+        self._dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        root_fd = os.open(self.base_dir, self._dir_flags)
+        try:
+            st = os.fstat(root_fd)
+            self._root_identity = (st.st_dev, st.st_ino)
+        finally:
+            os.close(root_fd)
+
+    @staticmethod
+    def _parts(relative_path: str) -> tuple[str, ...]:
+        if not isinstance(relative_path, str) or not relative_path or "\x00" in relative_path:
+            raise ValueError("invalid relative filesystem path")
+        p = Path(relative_path)
+        if p.is_absolute() or ".." in p.parts or not p.parts:
+            raise ValueError("path escapes base directory")
+        return p.parts
 
     def _resolve(self, relative_path: str) -> Path:
-        candidate = (self.base_dir / relative_path).resolve()
-        if self.base_dir not in candidate.parents and candidate != self.base_dir:
-            raise ValueError("path escapes base directory")
-        return candidate
+        # Lexical path is the action the policy approves. Actual traversal is
+        # descriptor-relative and cannot follow symlinked path components.
+        return self.base_dir.joinpath(*self._parts(relative_path))
+
+    def _open_parent(self, parts: tuple[str, ...], create: bool) -> tuple[int, int]:
+        root_fd = os.open(self.base_dir, self._dir_flags)
+        current = root_fd
+        try:
+            st = os.fstat(root_fd)
+            if (st.st_dev, st.st_ino) != self._root_identity:
+                raise ValueError("base directory changed after adapter creation")
+            for part in parts[:-1]:
+                if create:
+                    try:
+                        os.mkdir(part, mode=0o700, dir_fd=current)
+                    except FileExistsError:
+                        pass  # The next O_NOFOLLOW directory open validates it.
+                next_fd = os.open(part, self._dir_flags, dir_fd=current)
+                if current != root_fd:
+                    os.close(current)
+                current = next_fd
+            return root_fd, current
+        except BaseException:
+            if current != root_fd:
+                os.close(current)
+            os.close(root_fd)
+            raise
+
+    def _open_regular(self, relative_path: str, create: bool = False) -> int:
+        parts = self._parts(relative_path)
+        root_fd, parent_fd = self._open_parent(parts, create=create)
+        try:
+            flags = (os.O_WRONLY | os.O_CREAT) if create else os.O_RDONLY
+            flags |= os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+            fd = os.open(parts[-1], flags, mode=0o600, dir_fd=parent_fd)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise ValueError("filesystem target is not a regular file")
+                if create and st.st_nlink != 1:
+                    raise ValueError("refusing to overwrite a hard-linked file")
+                return fd
+            except BaseException:
+                os.close(fd)
+                raise
+        finally:
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            os.close(root_fd)
 
     def read_text(self, relative_path: str, context: AdapterContext) -> str:
         target = self._resolve(relative_path)
@@ -180,8 +259,9 @@ class FileSystemAdapter(_BaseAdapter):
         pre = self._inspect(context=context, planned_actions=[action], memory_reads=[str(target)], memory_writes=[])
         self._enforce_pre(pre)
 
-        data = target.read_text(encoding="utf-8")
-        bounded = data[: self.max_bytes]
+        fd = self._open_regular(relative_path)
+        with os.fdopen(fd, "rb") as f:
+            bounded = f.read(self.max_bytes).decode("utf-8", errors="replace")
         safe, redaction = self._sanitize_output(bounded)
 
         post = self._inspect(
@@ -207,21 +287,29 @@ class FileSystemAdapter(_BaseAdapter):
         return safe
 
     def write_text(self, relative_path: str, content: str, context: AdapterContext) -> None:
-        payload = content[: self.max_bytes]
+        # Never split a UTF-8 character while enforcing the byte limit.
+        payload = content[:self.max_bytes]
+        raw = payload.encode("utf-8")
+        if len(raw) > self.max_bytes:
+            raw = raw[:self.max_bytes]
+            payload = raw.decode("utf-8", errors="ignore")
+            raw = payload.encode("utf-8")
         target = self._resolve(relative_path)
         action = PlannedAction(action_type="write_filesystem", target=str(target))
         pre = self._inspect(context=context, planned_actions=[action], memory_reads=[], memory_writes=[str(target)])
         self._enforce_pre(pre)
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(payload, encoding="utf-8")
+        fd = self._open_regular(relative_path, create=True)
+        with os.fdopen(fd, "wb") as f:
+            f.truncate(0)
+            f.write(raw)
 
         post = self._inspect(
             context=context,
             planned_actions=[action],
             memory_reads=[],
             memory_writes=[str(target)],
-            model_output=f"wrote {len(payload.encode('utf-8'))} bytes",
+            model_output=f"wrote {len(raw)} bytes",
         )
         self._audit(
             "tool_filesystem_write",
@@ -229,10 +317,17 @@ class FileSystemAdapter(_BaseAdapter):
                 "decision_pre": pre.get("decision"),
                 "decision_post": post.get("decision"),
                 "path": str(target),
-                "bytes": len(payload.encode("utf-8")),
+                "bytes": len(raw),
                 "session_id": context.session_id,
             },
         )
+
+
+class _NoRedirect(url_request.HTTPRedirectHandler):
+    """Disallow ALL redirects; the final destination must never change silently."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("HTTP redirect denied by gateway: no redirect target was authorized")
 
 
 class HttpAdapter(_BaseAdapter):
@@ -252,7 +347,14 @@ class HttpAdapter(_BaseAdapter):
         method_upper = method.upper().strip()
         if method_upper not in {"GET", "POST"}:
             raise ValueError("only GET and POST are allowed")
+        if not url or url != url.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in url):
+            raise ValueError("invalid URL")
         parsed = urlparse(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("only absolute HTTP(S) URLs are allowed")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("embedded URL credentials are not allowed")
+        _ = parsed.port  # Force validation of malformed ports before authorization.
         host = (parsed.hostname or "").lower()
         if host not in self.allowed_hosts:
             raise ValueError("host is not allowed")
@@ -266,9 +368,19 @@ class HttpAdapter(_BaseAdapter):
             req.data = body.encode("utf-8")
             req.add_header("Content-Type", "text/plain; charset=utf-8")
 
+        # Never use implicit urllib redirects or environment-controlled proxy
+        # routing: either can send requests to a destination not in the policy.
+        opener = url_request.build_opener(url_request.ProxyHandler({}), _NoRedirect())
         try:
-            with url_request.urlopen(req, timeout=self.timeout_seconds) as resp:
+            with opener.open(req, timeout=self.timeout_seconds) as resp:
+                status = getattr(resp, "status", 200)
+                if status is not None and 300 <= int(status) < 400:
+                    raise ValueError("HTTP redirect denied by gateway")
                 text = resp.read().decode("utf-8", errors="replace")
+        except url_error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise ValueError("HTTP redirect denied by gateway") from exc
+            text = f"http_error:{exc.reason}"
         except url_error.URLError as exc:
             text = f"http_error:{exc.reason}"
 

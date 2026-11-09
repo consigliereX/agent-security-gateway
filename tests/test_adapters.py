@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 import sys
@@ -69,6 +70,7 @@ class AdaptersTests(unittest.TestCase):
         self.assertIn("hello", proc.stdout.lower())
         self.assertEqual(len(svc.calls), 2)
 
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "O_NOFOLLOW") and os.open in os.supports_dir_fd and os.mkdir in os.supports_dir_fd, "POSIX dirfd required")
     def test_filesystem_challenge_does_not_write(self) -> None:
         svc = StubService(["challenge"])
         with tempfile.TemporaryDirectory() as td:
@@ -82,6 +84,7 @@ class AdaptersTests(unittest.TestCase):
             self.assertFalse(p.exists())
             self.assertEqual(len(svc.calls), 1)
 
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "O_NOFOLLOW") and os.open in os.supports_dir_fd and os.mkdir in os.supports_dir_fd, "POSIX dirfd required")
     def test_filesystem_allowed_write_and_read(self) -> None:
         svc = StubService(["allow", "allow", "allow", "allow"])
         with tempfile.TemporaryDirectory() as td:
@@ -118,7 +121,8 @@ class AdaptersTests(unittest.TestCase):
             def read(self) -> bytes:
                 return b"ok"
 
-        with patch("firewall.adapters.url_request.urlopen", return_value=_Resp()) as mocked:
+        with patch("firewall.adapters.url_request.build_opener") as mocked:
+            mocked.return_value.open.return_value = _Resp()
             out = adapter.request("GET", "http://localhost/test", ctx)
             self.assertEqual(out, "ok")
             mocked.assert_called_once()

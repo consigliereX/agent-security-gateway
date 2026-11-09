@@ -6,7 +6,7 @@
 
 <p>
   <img src="https://img.shields.io/badge/STATUS-v1.0.0-111111?style=for-the-badge&logo=github&logoColor=white" />
-  <img src="https://img.shields.io/badge/TESTS-86%20PASSING-111111?style=for-the-badge&logo=checkmarx&logoColor=white" />
+  <img src="https://img.shields.io/badge/TESTS-UNIT%20TESTED-111111?style=for-the-badge&logo=checkmarx&logoColor=white" />
   <img src="https://img.shields.io/badge/PYTHON-3.11%2B-111111?style=for-the-badge&logo=python&logoColor=white" />
   <img src="https://img.shields.io/badge/FASTAPI-GATEWAY-111111?style=for-the-badge&logo=fastapi&logoColor=white" />
 </p>
@@ -174,7 +174,6 @@ The gateway can return:
 ├── .gitignore
 ├── Dockerfile
 ├── firewall_config.example.json
-├── gateway_sessions.sqlite3
 ├── pyproject.toml
 ├── README.md
 ├── configs/
@@ -402,7 +401,7 @@ python -m unittest discover -s tests -p "test_*.py"
 Expected result:
 
 ```text
-Ran 86 tests ... OK
+Ran <N> tests ... OK
 ```
 
 ---
@@ -428,6 +427,15 @@ Ran 86 tests ... OK
 - The shipped `gateway_sessions.sqlite3` has been removed from version control by this maintenance change, but **old Git history still contains it**. Assess any previous real session records/tokens and rotate exposed credentials as necessary; do not publish the local runtime DB.
 - This gateway cannot constrain an agent that retains access to tools outside its adapters. Use operating-system sandboxing, filesystem permissions, and egress controls.
 - Default general authentication is still off for local development: **bind only to `127.0.0.1`** unless explicitly secured behind a trustworthy network boundary.
+
+## Enforcement M2 — HTTP and filesystem boundaries
+
+- HTTP supports only explicit `http://` and `https://` URLs with allowlisted hosts. Redirects of **all kinds** are rejected rather than silently following an unapproved destination; URL-embedded credentials and environment-provided HTTP proxies are disabled.
+- HTTP host allowlisting does **not** pin DNS resolution or eliminate DNS rebinding, compromised DNS, or network-layer routing risks. Use OS/network egress filtering for untrusted destinations.
+- Filesystem access on POSIX platforms uses descriptor-relative `open` with `O_NOFOLLOW`; nested symlinks and non-regular files are rejected, and writes also reject hard-linked files. Path selection is bound to the configured root and checked after policy inspection.
+- Filesystem confinement is implemented for POSIX platforms supporting `dir_fd` and `O_NOFOLLOW`. The adapter intentionally **fails closed on unsupported platforms**, including Windows; use an OS-specific safe backend rather than weakening these checks.
+- This is an adapter path-confinement measure, **not a process/container sandbox**: mount points, privileged processes, unmediated agent tools, and other I/O channels are outside this guarantee.
+- M2 regression tests simulate symlink swaps during approval, hard links, nested path traversal, HTTP 3xx responses, and proxy/redirect handler configuration without sending requests to external services.
 
 ## Operational limits
 
