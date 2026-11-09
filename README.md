@@ -462,6 +462,58 @@ python scripts/m3_adversarial.py --evidence .git/security-m3-evidence.json \
 
 The scripted test deliberately reproduces one **unmediated subprocess bypass** on a disposable temporary file and records it as `FIND`, not `PASS`. That is an expected design limitation of adapter-level mediation; it is **not** proof of secure agent isolation. Successful M3 tests demonstrate real MCP transport and mediated adapter behavior, **not** enforcement against processes with unrestricted OS privileges. The M3 script does not automatically connect to OMP or claim an actual OMP run.
 
+## Enforcement M4 — verified child-process isolation (Linux only)
+
+M4 introduces `gateway.os_sandbox`, a **fail-closed** Bubblewrap launcher for explicitly
+selected synthetic agent or MCP-client child processes. Unlike the M3 in-process
+tool list, the M4 child has a separate **user, mount, PID and network namespace**.
+It receives only `/usr`, `/bin` and dynamic-linker libraries read-only; a
+**read-only** `/work` containing deliberately staged code/data; and capped
+private `/tmp` and `/run` tmpfs mounts. No host home, SSH agent, browser session,
+proxy configuration or outbound network is passed through.
+
+The trusted M3 `gateway.mcp_stdio` process remains **outside** the sandbox; the
+child's standard output and input carry MCP JSON-line requests/responses to it.
+Consequently, files under `/work` can be changed through authorized MCP writes,
+but not by the child's direct filesystem or subprocess calls. These subprocesses
+may still execute **inside the namespace**; this prevents host escape, not code
+execution within the sandbox.
+
+Install Bubblewrap on Arch if not already present:
+
+```bash
+sudo pacman -S --needed bubblewrap
+```
+
+To validate the **actual kernel sandbox**, run from the repository root:
+
+```bash
+.venv/bin/python scripts/m4_adversarial.py --evidence .git/security-m4-evidence.json
+```
+
+For a custom MCP-speaking synthetic agent, create a dedicated staging folder
+containing only code/data that the agent may **read**; never point the sandbox at
+your home directory or a checkout that contains sensitive files. The agent's
+stdout/stdin must speak the M3 JSON-line MCP protocol (not arbitrary chat output).
+Example: given `/absolute/staging/agent.py` and a private database path:
+
+```bash
+.venv/bin/python -m gateway.os_sandbox \
+  --workspace /absolute/staging \
+  --state-db /absolute/private/asg-m4.sqlite3 \
+  -- /usr/bin/python3 /work/agent.py
+```
+
+**Limitations:** Real OMP and Claude Code have **not** been launched in this
+sandbox, and their existing tools and permissions are unchanged. Using this
+launcher does not isolate a separate inference server or a host agent running
+outside the launcher. On kernels that prohibit unprivileged user namespaces,
+launch fails closed instead of falling back to an unsafe subprocess.
+Bubblewrap is an important boundary, not a complete defense against kernel
+vulnerabilities, resource exhaustion, hostile native code, or malicious inputs
+to a trusted gateway. This version lacks seccomp filtering and cgroup limits;
+external deployment must address those separately.
+
 ## Operational limits
 
 - API-key auth is shared-secret based
