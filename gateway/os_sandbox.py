@@ -37,7 +37,7 @@ def _workspace(root: str | Path) -> Path:
     return resolved
 
 
-def _verify_staged_tree(root: Path) -> None:
+def _verify_staged_tree(root: Path, *, max_total_bytes: int = 256 * 1024 * 1024) -> None:
     """Refuse nonregular objects and nested mounts that expose host resources."""
     # Explicitly reject bind-mounted subdirectories, including same-device
     # bind mounts that a simple st_dev comparison would not identify.
@@ -79,7 +79,7 @@ def _verify_staged_tree(root: Path) -> None:
                     if info.st_nlink != 1:
                         raise ValueError("workspace contains a hard-linked file")
                     total_size += info.st_size
-                    if total_size > 256 * 1024 * 1024:
+                    if total_size > max_total_bytes:
                         raise ValueError("workspace exceeds 256 MiB staged file limit")
                 else:
                     raise ValueError("workspace contains a symlink, socket, device or FIFO")
@@ -122,7 +122,82 @@ def _minimal_env() -> dict[str, str]:
     return {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 
 
-def build_command(workspace: str | Path, agent_argv: Sequence[str], bwrap: str | None = None) -> list[str]:
+def _runtime_executable(path: str | Path, root: Path) -> Path:
+    """Accept one deliberately staged, private ELF executable as a read-only mount.
+
+    This is NOT a facility to bind arbitrary host directories. The one mounted
+    file must be owned by the current user, private, non-linked, within a
+    private owned staging directory, and outside the exposed workspace.
+    """
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute() or candidate.is_symlink():
+        raise ValueError("runtime executable must be an absolute, non-symlink file")
+    candidate = candidate.resolve(strict=True)
+    if candidate == root or root in candidate.parents:
+        raise ValueError("runtime executable must be outside the workspace")
+    st = candidate.stat()
+    parent = candidate.parent
+    pst = parent.stat()
+    if (not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= 1024 * 1024 * 1024
+        or st.st_nlink != 1 or st.st_uid != os.getuid()
+        or (st.st_mode & 0o077) != 0 or not (st.st_mode & stat.S_IXUSR)
+        or not stat.S_ISDIR(pst.st_mode) or pst.st_uid != os.getuid()
+        or (pst.st_mode & 0o077) != 0 or parent.is_symlink()):
+        raise ValueError("runtime must be a private owner-only executable in a private directory")
+    with candidate.open("rb") as stream:
+        if stream.read(4) != b"\x7fELF":
+            raise ValueError("only a staged ELF binary can be mounted")
+    return candidate
+
+
+def _native_bundle(path: str | Path, root: Path) -> Path:
+    """Validate one disposable version-scoped addon directory; never bind user home.
+
+    The native executable code is copied from a local installation to an
+    owner-only directory; its host source and other user data stay invisible.
+    """
+    raw = Path(path).expanduser()
+    if not raw.is_absolute() or raw.is_symlink() or not raw.is_dir():
+        raise ValueError("native bundle must be an existing absolute non-symlink directory")
+    bundle = raw.resolve(strict=True)
+    if bundle == root or root in bundle.parents or bundle in root.parents:
+        raise ValueError("native bundle must not contain/overlap workspace")
+    for folder in (bundle, bundle.parent):
+        st = folder.lstat()
+        if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid()
+            or (st.st_mode & 0o077) or folder.is_symlink()):
+            raise ValueError("native bundle directory must be private and owner-only")
+    versions = list(bundle.iterdir())
+    if len(versions) != 1 or not versions[0].is_dir() or versions[0].is_symlink():
+        raise ValueError("native bundle must hold exactly one version directory")
+    if not __import__('re').fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", versions[0].name):
+        raise ValueError("invalid native bundle version")
+    st = versions[0].lstat()
+    if st.st_uid != os.getuid() or (st.st_mode & 0o077):
+        raise ValueError("native version directory must be private")
+    entries = list(versions[0].iterdir())
+    names = {"pi_natives.linux-x64-modern.node", "pi_natives.linux-x64-baseline.node",
+             "pi_natives.linux-x64.node"}
+    if not 1 <= len(entries) <= len(names):
+        raise ValueError("native bundle requires 1..3 approved addon files")
+    for file in entries:
+        st = file.lstat()
+        if file.name not in names or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise ValueError("native bundle contains an unexpected or linked item")
+        if st.st_uid != os.getuid() or (st.st_mode & 0o077) or not (0 < st.st_size <= 128 * 1024 * 1024):
+            raise ValueError("native addon must be private, nonempty and at most 128 MiB")
+        with file.open('rb') as stream:
+            if stream.read(4) != b"\x7fELF":
+                raise ValueError("native addon must be an ELF shared library")
+    # Native addons live outside the agent workspace. Up to three approved
+    # variants may each be 128 MiB; the /work cap remains 256 MiB.
+    _verify_staged_tree(bundle, max_total_bytes=384 * 1024 * 1024)
+    return bundle
+
+
+def build_command(workspace: str | Path, agent_argv: Sequence[str], bwrap: str | None = None,
+                  *, runtime_executable: str | Path | None = None,
+                  native_bundle: str | Path | None = None) -> list[str]:
     root = _workspace(workspace)
     if not agent_argv or not all(isinstance(x, str) and x and "\x00" not in x for x in agent_argv):
         raise ValueError("nonempty agent argv of strings is required")
@@ -139,8 +214,17 @@ def build_command(workspace: str | Path, agent_argv: Sequence[str], bwrap: str |
             cmd += ["--ro-bind", path, path]
     cmd += ["--proc", "/proc", "--dev", "/dev",
             "--perms", "1777", "--size", "67108864", "--tmpfs", "/tmp",
-            "--perms", "0700", "--size", "8388608", "--tmpfs", "/run", "--dir", "/work", "--ro-bind", str(root), "/work",
-            "--chdir", "/work", "--", *agent_argv]
+            "--perms", "0700", "--size", "8388608", "--tmpfs", "/run", "--dir", "/work", "--ro-bind", str(root), "/work"]
+    if runtime_executable is not None or native_bundle is not None:
+        cmd += ["--dir", "/opt"]
+    if runtime_executable is not None:
+        runtime = _runtime_executable(runtime_executable, root)
+        cmd.extend(["--ro-bind", str(runtime), "/opt/asg-omp"])
+    if native_bundle is not None:
+        natives = _native_bundle(native_bundle, root)
+        # Read-only versioned addon copy; never bind ~/.omp or arbitrary directories.
+        cmd.extend(["--ro-bind", str(natives), "/opt/asg-omp-natives"])
+    cmd += ["--chdir", "/work", "--", *agent_argv]
     return cmd
 
 
@@ -154,11 +238,14 @@ def _terminate(proc: subprocess.Popen) -> None:
     proc.wait(timeout=5)
 
 
-def run_child(workspace: str | Path, agent_argv: Sequence[str], *, timeout: float = 15) -> subprocess.CompletedProcess[str]:
+def run_child(workspace: str | Path, agent_argv: Sequence[str], *, timeout: float = 15,
+              runtime_executable: str | Path | None = None,
+              native_bundle: str | Path | None = None) -> subprocess.CompletedProcess[str]:
     """A non-MCP diagnostic invocation, with bounded time and no network."""
     if not (0 < timeout <= 120):
         raise ValueError("timeout must be within 1..120 seconds")
-    return subprocess.run(build_command(workspace, agent_argv), timeout=timeout,
+    return subprocess.run(build_command(workspace, agent_argv, runtime_executable=runtime_executable,
+                                        native_bundle=native_bundle), timeout=timeout,
                           capture_output=True, text=True, env=_minimal_env(),
                           start_new_session=True, check=False)
 
@@ -184,9 +271,28 @@ def _pump(source: IO[bytes], dest: IO[bytes], failures: list[str]) -> None:
             pass
 
 
+def _drain_child_stderr(source: IO[bytes], captured: list[bytes]) -> None:
+    """Drain untrusted child diagnostics without blocking or unbounded memory."""
+    tail = b""
+    try:
+        while True:
+            part = source.read(4096)
+            if not part:
+                break
+            tail = (tail + part)[-12288:]
+    except OSError:
+        pass
+    finally:
+        captured.append(tail)
+        source.close()
+
+
 def run_mcp_bridge(workspace: str | Path, state_db: str | Path,
                    agent_argv: Sequence[str], *, timeout: float = 20,
-                   repo_root: str | Path | None = None) -> tuple[int, int]:
+                   repo_root: str | Path | None = None,
+                   runtime_executable: str | Path | None = None,
+                   native_bundle: str | Path | None = None,
+                   diagnostics: dict[str, str] | None = None) -> tuple[int, int]:
     """Run a sandboxed MCP-client child, relaying its stdio to trusted M3 MCP.
 
     No tool access other than the host MCP server is granted. The child still
@@ -201,7 +307,8 @@ def run_mcp_bridge(workspace: str | Path, state_db: str | Path,
     repo = Path(repo_root).resolve() if repo_root else Path(__file__).resolve().parents[1]
     if not (repo / "gateway" / "mcp_stdio.py").is_file():
         raise SandboxUnavailable("trusted M3 MCP gateway source is unavailable")
-    binary_command = build_command(root, agent_argv)
+    binary_command = build_command(root, agent_argv, runtime_executable=runtime_executable,
+                                   native_bundle=native_bundle)
     db.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     broker_env = _minimal_env()
     broker_env.update({"ASG_MCP_ROOT": str(root), "ASG_MCP_DB_PATH": str(db),
@@ -214,8 +321,14 @@ def run_mcp_bridge(workspace: str | Path, state_db: str | Path,
     failures: list[str] = []
     try:
         child = subprocess.Popen(binary_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL, env=_minimal_env(),
-                                 start_new_session=True)
+                                 stderr=subprocess.PIPE if diagnostics is not None else subprocess.DEVNULL,
+                                 env=_minimal_env(), start_new_session=True)
+        stderr_capture: list[bytes] = []
+        stderr_thread = None
+        if diagnostics is not None:
+            stderr_thread = threading.Thread(target=_drain_child_stderr,
+                                             args=(child.stderr, stderr_capture), daemon=True)
+            stderr_thread.start()
         to_broker = threading.Thread(target=_pump, args=(child.stdout, broker.stdin, failures), daemon=True)
         to_child = threading.Thread(target=_pump, args=(broker.stdout, child.stdin, failures), daemon=True)
         to_broker.start()
@@ -229,6 +342,11 @@ def run_mcp_bridge(workspace: str | Path, state_db: str | Path,
             to_child.join(timeout=3)
             if to_child.is_alive():
                 raise SandboxUnavailable("MCP broker->child channel did not close")
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=3)
+                if stderr_thread.is_alive():
+                    raise SandboxUnavailable("sandbox diagnostics channel failed to close")
+                diagnostics["child_stderr_tail"] = (stderr_capture[0] if stderr_capture else b"").decode("utf-8", "replace")
             if failures:
                 raise SandboxUnavailable("MCP framing/transport invalid: " + ",".join(failures))
             return child_code, broker_code

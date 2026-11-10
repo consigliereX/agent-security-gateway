@@ -514,6 +514,90 @@ vulnerabilities, resource exhaustion, hostile native code, or malicious inputs
 to a trusted gateway. This version lacks seccomp filtering and cgroup limits;
 external deployment must address those separately.
 
+## Enforcement M5 — real OMP process trial (opt-in, Linux)
+
+M5 is a **live real-agent acceptance test**, not a deployment switch. The runner
+stages the installed OMP executable (or a size-limited inspected package)
+into a temporary directory and launches it **inside the M4 Bubblewrap
+namespace**. An isolated OMP profile contains no saved credentials, provider
+settings, extensions, user rules, SSH agent, host home, or real project data.
+The model endpoint is a **deterministic local test stub inside the namespace**;
+this validates OMP tool wiring, not a real inference model or prompt resistance.
+
+The test intentionally enables OMP's shell tool to try a **direct modification
+of a read-only sandbox file**. It then drives an **MCP `asg_write_file` call**
+through a sandbox-local stdio relay to the trusted M4 gateway running outside
+the namespace. The test accepts only if the direct write is prevented, the
+brokered write succeeds, and the trusted SQLite audit records it.
+
+From the repository on the Arch host (requires Bubblewrap and the installed
+`omp` CLI):
+
+```bash
+.venv/bin/python scripts/m5_real_omp.py --repo . \
+  --evidence .git/security-m5-evidence.json
+```
+
+A missing/unsupported OMP installation, incompatible MCP discovery, unavailable
+local loopback inside the namespace, or missing proof produces **UNRESOLVED** and
+no publication. M5 does not modify your current OMP/Claude Code configuration,
+run against your real source tree, or connect to your remote/local LLM server.
+The separate Claude Code integration and a real-model adversarial test remain
+outstanding. A passed M5 proves this **specific OMP launch and restricted broker
+path**, not general-purpose kernel/agent security or confinement of an existing
+host OMP session.
+
+
+**Large OMP ELF staging:** If the installed OMP executable is larger than the 235 MiB workspace staging budget, M5 copies only that verified ELF into a separate owner-only temporary runtime directory (maximum 1 GiB), mounts **that single file** read-only as `/opt/asg-omp` inside Bubblewrap, and retains the existing 256 MiB limit on the exposed workspace. It never binds the host installation directory, user home, model cache, SSH credentials, or a writable executable into the child. The runtime mount is temporary; OMP and Claude Code global configuration remain unchanged.
+
+
+**M5 v4 diagnostics:** On an unresolved OMP run, the host captures only the
+sandboxed child's last 12 KiB of stderr (not the agent's stdout/MCP channel).
+The deterministic controller emits a structured summary containing the OMP
+return code, model-request count, offered tool choices and bounded OMP output.
+Evidence stays under the local `.git/security-m5-evidence.json` and is never
+committed. The verdict still depends on host-observed file changes and SQLite
+audit records; child-provided diagnostic claims cannot substitute for proof.
+
+### M5 native addon staging (offline)
+
+The standalone OMP ELF may require `pi_natives.*.node` at runtime. M5 copies
+only matching **versioned Linux x64 ELF addons** from the installed host cache
+(`~/.omp/natives/<version>/`, the isolated OMP cache, or XDG data cache) into
+an owner-only temporary directory. Only this **verified copy** is mounted
+read-only at `/opt/asg-omp-natives`, with the sandbox child explicitly setting
+`PI_NATIVES_DIR` to that path. The agent never receives the original cache,
+home, network or secrets. The native cache is not added to the staged `/work`
+workspace, nor persisted or published. Checksums and file counts appear in
+local evidence. A missing cache stops the run without a commit or download.
+An optional `--native-dir /absolute/installed/cache-root` on the single-file
+publisher selects a known local cache if it is non-standard.
+
+**M5 v6 cache-copy rule:** A cached addon is allowed to have multiple source
+hard links because its ELF bytes are staged into a separate, owner-only,
+single-link inode. The source file and directory are never bind-mounted.
+Symlinks, nonregular inputs, files beyond the 96 MiB per-addon cap, changed
+sources and failed SHA-256 checks still fail closed. When a cache is rejected,
+local evidence includes the filename and the precise validation failure.
+
+**M5 native-addon staging bounds:** A matching cached native ELF is copied
+into a new private inode and mounted read-only. The per-addon bound is 128 MiB,
+with at most three approved variants and a separate 384 MiB native bundle
+budget. The agent `/work` staging limit remains **256 MiB**. No addon downloads,
+private host-directory mounts, or host network access are enabled.
+
+M5 v8 retains the fail-closed live OMP acceptance gate. The controller now uses
+separate OMP/MCP deadlines, records whether the real OMP process connected to
+MCP, and preserves bounded stdout/stderr even when the OMP process times out.
+An absent MCP connection, zero model requests, or a timed-out OMP process is
+an UNRESOLVED result and must never be treated as a passed isolation test.
+
+M5 headless-agent pipe isolation: the OMP subprocess receives EOF from
+`/dev/null` on its own stdin; the sandbox controller retains its separate MCP
+request/reply pipe. This prevents OMP 18.x from waiting indefinitely in
+`readPipedInput` for a broker pipe that cannot close until the agent exits.
+The existing Linux namespace restrictions, read-only mounts and verification
+gates are unchanged.
 ## Operational limits
 
 - API-key auth is shared-secret based
